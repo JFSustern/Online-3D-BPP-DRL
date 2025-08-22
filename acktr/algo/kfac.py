@@ -210,10 +210,27 @@ class KFACOptimizer(optim.Optimizer):
                 # My asynchronous implementation exists, I will add it later.
                 # Experimenting with different ways to this in PyTorch.
 
-                self.d_g[m], self.Q_g[m] = torch.linalg.eigh(
-                    self.m_gg[m])
-                self.d_a[m], self.Q_a[m] = torch.linalg.eigh(
-                    self.m_aa[m])
+                # Robustify covariance matrices before EVD to avoid cusolver failures
+                gg = self.m_gg[m]
+                aa = self.m_aa[m]
+
+                # Symmetrize
+                gg = 0.5 * (gg + gg.transpose(-1, -2))
+                aa = 0.5 * (aa + aa.transpose(-1, -2))
+
+                # Replace NaN/Inf with zeros
+                gg = torch.nan_to_num(gg, nan=0.0, posinf=0.0, neginf=0.0)
+                aa = torch.nan_to_num(aa, nan=0.0, posinf=0.0, neginf=0.0)
+
+                # Add small jitter to ensure positive semi-definiteness
+                jitter = 1e-6
+                eye_g = torch.eye(gg.size(0), device=gg.device, dtype=gg.dtype)
+                eye_a = torch.eye(aa.size(0), device=aa.device, dtype=aa.dtype)
+                gg = gg + jitter * eye_g
+                aa = aa + jitter * eye_a
+
+                self.d_g[m], self.Q_g[m] = torch.linalg.eigh(gg)
+                self.d_a[m], self.Q_a[m] = torch.linalg.eigh(aa)
 
                 self.d_a[m].mul_((self.d_a[m] > 1e-6).float())
                 self.d_g[m].mul_((self.d_g[m] > 1e-6).float())
@@ -228,8 +245,10 @@ class KFACOptimizer(optim.Optimizer):
                 self.d_a[m]=self.d_a[m].to(self.Q_g[m].device)
 
             v1 = self.Q_g[m].t() @ p_grad_mat @ self.Q_a[m]
-            v2 = v1 / (
-                self.d_g[m].unsqueeze(1) * self.d_a[m].unsqueeze(0) + la)
+            denom = self.d_g[m].unsqueeze(1) * self.d_a[m].unsqueeze(0) + la
+            # Prevent division by zero / NaN
+            denom = torch.nan_to_num(denom, nan=1.0, posinf=1.0, neginf=1.0)
+            v2 = v1 / denom
             v = self.Q_g[m] @ v2 @ self.Q_a[m].t()
 
             v = v.view(p.grad.data.size())
@@ -245,7 +264,10 @@ class KFACOptimizer(optim.Optimizer):
             vg_sum += (v * p.grad.data * self.lr * self.lr).sum()
 
 
-        nu = min(1, math.sqrt(self.kl_clip / vg_sum))
+        # Guard against non-finite vg_sum
+        if not torch.isfinite(vg_sum):
+            vg_sum = torch.tensor(1.0, device=next(self.model.parameters()).device, dtype=next(self.model.parameters()).dtype)
+        nu = min(1, math.sqrt(self.kl_clip / max(vg_sum.item(), 1e-12)))
 
         for p in self.model.parameters():
             # if len(p.size())>=3:
